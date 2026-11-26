@@ -6,6 +6,7 @@ vb09/flight/phases.py —— 起飞 / 下降 / AUTO.LAND / 接管 / cleanup 判�
 共享状态改成 F.名字 (vb09/flight/ctx.py 的 FlightContext 单例), 参数是 C.名字。
 """
 
+import contextlib
 import sys
 import math
 import threading
@@ -15,9 +16,65 @@ import rospy
 from vb09.flight import config as C
 
 from vb09.flight.ctx import F
-from vb09.flight.ctx import _MAV_RESULT, check_abort, fcu_texts_since, request_abort, set_phase
+from vb09.flight.ctx import _MAV_RESULT, check_abort, fcu_texts_since, request_abort, request_land, set_phase
 from vb09.flight.devices import KeyReader, _flush_stdin
 from vb09.flight.log import timing_queue, timing_queue_lock
+
+
+@contextlib.contextmanager
+def _safety_keys(tag):
+    """
+    为起飞 / 缓降 / AUTO.LAND 提供阶段级 cbreak 键盘监听 (X 停桨 / L 降落 / EOF 断连)。
+    每个阶段独立进入/退出 KeyReader，保证任何退出路径都恢复终端属性，不新增模块级可变全局。
+    非 tty (如离线仿真) 静默返回 None。
+    """
+    keys = None
+    if sys.stdin.isatty():
+        try:
+            keys = KeyReader()
+            keys.__enter__()
+        except Exception as e:
+            rospy.logwarn(f"[keys] {tag} 阶段安全键读取器创建失败 (X/L 不可用): {e}")
+            keys = None
+    try:
+        yield keys
+    finally:
+        if keys is not None:
+            keys.__exit__(None, None, None)
+
+
+def _poll_safety_keys(keys, tag, allow_land=True):
+    """
+    轮询一次安全键。返回 (keys_next, hit):
+      · X   → request_abort (立即停桨)
+      · EOF → request_land (allow_land=True 时触发降落)，同时返回 keys_next=None 避免重复读已关闭的 stdin
+      · L   → allow_land=True 时 request_land；已在降落流程中则仅提示
+    """
+    if keys is None:
+        return None, False
+    try:
+        _, flags, eof, _ = keys.poll()
+    except Exception:
+        return keys, False
+    if 'x' in flags:
+        rospy.logerr(f"[keys] ★ {tag} 阶段收到 X — 立即停桨")
+        request_abort(f"{tag} X 键")
+        return keys, True
+    if eof:
+        if allow_land:
+            rospy.logerr(f"[keys] ★ {tag} 阶段 stdin EOF (SSH 断连?) — 请求降落")
+            request_land(f"{tag} stdin EOF")
+            return None, True
+        rospy.logwarn(f"[keys] {tag} 阶段 stdin EOF (SSH 断连?) — 已在降落流程中")
+        request_land(f"{tag} stdin EOF")
+        return None, False
+    if 'l' in flags:
+        if allow_land:
+            rospy.logwarn(f"[keys] ★ {tag} 阶段收到 L — 请求降落")
+            request_land(f"{tag} L 键")
+            return keys, True
+        rospy.loginfo(f"[keys] {tag} 阶段收到 L — 已在降落流程中 (紧急停桨请按 X)")
+    return keys, False
 
 
 def force_disarm_with_timeout(cmd_long, overall_timeout=2.0):
@@ -63,41 +120,43 @@ def phase_takeoff():
     reach_count = 0
     rate = rospy.Rate(C.PHASE_LOOP_HZ)
 
-    while rospy.Time.now() < t_end:
-        check_abort()
-        if F.land_flag.is_set():
-            rospy.logwarn("[takeoff] LAND 请求 — 停止爬升")
-            return target_z
-        zf = F.tele.z_filtered()
-        if zf is not None:
-            dz = zf - F.INITIAL_Z
-            if not F.in_air[0] and dz > C.TAKEOFF_LIFTOFF_DZ:
-                F.in_air[0] = True
-                rospy.logwarn(f"[takeoff] LIFTOFF DETECTED at dz={dz:.2f}")
+    with _safety_keys("takeoff") as keys:
+        while rospy.Time.now() < t_end:
+            keys, _ = _poll_safety_keys(keys, "takeoff", allow_land=True)
+            check_abort()
+            if F.land_flag.is_set():
+                rospy.logwarn("[takeoff] LAND 请求 — 停止爬升")
+                return target_z
+            zf = F.tele.z_filtered()
+            if zf is not None:
+                dz = zf - F.INITIAL_Z
+                if not F.in_air[0] and dz > C.TAKEOFF_LIFTOFF_DZ:
+                    F.in_air[0] = True
+                    rospy.logwarn(f"[takeoff] LIFTOFF DETECTED at dz={dz:.2f}")
 
-            if abs(zf - target_z) < C.TAKEOFF_REACH_TOL:
-                reach_count += 1
-                if reach_count >= reach_frames_target:
-                    rospy.loginfo(f"[takeoff] REACHED z={zf:.2f} "
-                                  f"(target {target_z:.2f})")
-                    return target_z
-            else:
-                reach_count = 0
-
-            if (rospy.Time.now() - t_log).to_sec() >= 0.2:
-                px, py = F.tele.xy()
-                v = F.tele.velocity.twist.linear if F.tele.velocity else None
-                dx, dy = px - F.INITIAL_X, py - F.INITIAL_Y
-                if v:
-                    rospy.loginfo(f"    d=({dx:+.2f},{dy:+.2f},{dz:+.2f}) "
-                                  f"v=({v.x:+.2f},{v.y:+.2f},{v.z:+.2f}) "
-                                  f"err_z={target_z-zf:+.2f} "
-                                  f"reach_cnt={reach_count}")
+                if abs(zf - target_z) < C.TAKEOFF_REACH_TOL:
+                    reach_count += 1
+                    if reach_count >= reach_frames_target:
+                        rospy.loginfo(f"[takeoff] REACHED z={zf:.2f} "
+                                      f"(target {target_z:.2f})")
+                        return target_z
                 else:
-                    rospy.loginfo(f"    d=({dx:+.2f},{dy:+.2f},{dz:+.2f}) "
-                                  f"reach_cnt={reach_count}")
-                t_log = rospy.Time.now()
-        rate.sleep()
+                    reach_count = 0
+
+                if (rospy.Time.now() - t_log).to_sec() >= 0.2:
+                    px, py = F.tele.xy()
+                    v = F.tele.velocity.twist.linear if F.tele.velocity else None
+                    dx, dy = px - F.INITIAL_X, py - F.INITIAL_Y
+                    if v:
+                        rospy.loginfo(f"    d=({dx:+.2f},{dy:+.2f},{dz:+.2f}) "
+                                      f"v=({v.x:+.2f},{v.y:+.2f},{v.z:+.2f}) "
+                                      f"err_z={target_z-zf:+.2f} "
+                                      f"reach_cnt={reach_count}")
+                    else:
+                        rospy.loginfo(f"    d=({dx:+.2f},{dy:+.2f},{dz:+.2f}) "
+                                      f"reach_cnt={reach_count}")
+                    t_log = rospy.Time.now()
+            rate.sleep()
 
     zf = F.tele.z_filtered()
     dz_final = (zf - F.INITIAL_Z) if zf is not None else 0.0
@@ -128,37 +187,45 @@ def phase_descend(z_from, yaw_hold, hold_x, hold_y):
     # 从"指令高度"和"实际高度"里取低的那个起步。LAND 路径下 z_from 可能
     # 是个很旧的值 (比如起飞阶段就触发了 LAND)，从那里往下斜坡会白等几秒。
     zf0 = F.tele.z_filtered()
+    # 已贴地 / 不高于降落目标时，下面的 max(..., z_target_final) 会把设定点往上拉到
+    # +DESCEND_Z_TARGET_DZ，导致电机持续爬升/堵转直到超时 → 直接转 auto_land。
+    if zf0 is not None and zf0 <= z_target_final + C.DESCEND_REACH_TOL:
+        rospy.logwarn(f"[descend] 实际高度 {zf0:.2f} 已不高于降落目标 {z_target_final:.2f} "
+                      f"(容差 {C.DESCEND_REACH_TOL:.2f}) — 直接进 auto_land，不往上拉")
+        return
     target_z = min(z_from, zf0) if zf0 is not None else z_from
     rate = rospy.Rate(20)
     last = rospy.Time.now()
     t_end = rospy.Time.now() + rospy.Duration(C.DESCEND_TIMEOUT)
     t_log = rospy.Time.now()
 
-    while rospy.Time.now() < t_end:
-        check_abort()
-        if F.takeover[0] is not None:
-            rospy.logwarn("[descend] 控制权被接管 — 停止下降, 不再切 AUTO.LAND")
-            return
-        now = rospy.Time.now()
-        dt = min((now - last).to_sec(), 0.1)
-        last = now
-
-        target_z = max(target_z - C.DESCEND_SPEED * dt, z_target_final)
-        F.setpoint.set_zhold_mode(hold_x, hold_y, target_z, yaw_hold, 0.0, 0.0)
-
-        if (now - t_log).to_sec() >= 0.3:
-            zf = F.tele.z_filtered()
-            dz_real = (zf - F.INITIAL_Z) if zf is not None else float('nan')
-            rospy.loginfo(f"    target_dz={target_z-F.INITIAL_Z:+.2f}  "
-                          f"real_dz={dz_real:+.2f}")
-            t_log = now
-
-        if target_z <= z_target_final + 1e-3:
-            zf = F.tele.z_filtered()
-            if zf is not None and abs(zf - z_target_final) < C.DESCEND_REACH_TOL:
-                rospy.loginfo("[descend] 到达低高度，准备 auto_land")
+    with _safety_keys("descend") as keys:
+        while rospy.Time.now() < t_end:
+            keys, _ = _poll_safety_keys(keys, "descend", allow_land=False)
+            check_abort()
+            if F.takeover[0] is not None:
+                rospy.logwarn("[descend] 控制权被接管 — 停止下降, 不再切 AUTO.LAND")
                 return
-        rate.sleep()
+            now = rospy.Time.now()
+            dt = min((now - last).to_sec(), 0.1)
+            last = now
+
+            target_z = max(target_z - C.DESCEND_SPEED * dt, z_target_final)
+            F.setpoint.set_zhold_mode(hold_x, hold_y, target_z, yaw_hold, 0.0, 0.0)
+
+            if (now - t_log).to_sec() >= 0.3:
+                zf = F.tele.z_filtered()
+                dz_real = (zf - F.INITIAL_Z) if zf is not None else float('nan')
+                rospy.loginfo(f"    target_dz={target_z-F.INITIAL_Z:+.2f}  "
+                              f"real_dz={dz_real:+.2f}")
+                t_log = now
+
+            if target_z <= z_target_final + 1e-3:
+                zf = F.tele.z_filtered()
+                if zf is not None and zf <= z_target_final + C.DESCEND_REACH_TOL:
+                    rospy.loginfo("[descend] 到达低高度，准备 auto_land")
+                    return
+            rate.sleep()
 
     rospy.logwarn("[descend] TIMEOUT — 强行进入 auto_land")
 
@@ -198,18 +265,20 @@ def phase_auto_land(set_mode):
     tmo = auto_land_timeout()
     rospy.loginfo(f"[auto_land] 等待 PX4 落地上锁 (最长 {tmo:.0f}s)")
     t_end = rospy.Time.now() + rospy.Duration(tmo)
-    while rospy.Time.now() < t_end:
-        if F.abort_flag.is_set():
-            return False
-        if F.takeover[0] is not None:
-            # AUTO.LAND 之后飞手又切走了 (safety_monitor 现在也看这种情况)
-            rospy.logwarn(f"[auto_land] 降落中控制权被接管 ({F.takeover[0]}) — 停手")
-            return False
-        if F.tele.state and not F.tele.state.armed:
-            rospy.loginfo("[auto_land] PX4 已在着陆时 disarm")
-            F.in_air[0] = False
-            return True
-        rospy.sleep(0.3)
+    with _safety_keys("auto_land") as keys:
+        while rospy.Time.now() < t_end:
+            keys, _ = _poll_safety_keys(keys, "auto_land", allow_land=False)
+            if F.abort_flag.is_set():
+                return False
+            if F.takeover[0] is not None:
+                # AUTO.LAND 之后飞手又切走了 (safety_monitor 现在也看这种情况)
+                rospy.logwarn(f"[auto_land] 降落中控制权被接管 ({F.takeover[0]}) — 停手")
+                return False
+            if F.tele.state and not F.tele.state.armed:
+                rospy.loginfo("[auto_land] PX4 已在着陆时 disarm")
+                F.in_air[0] = False
+                return True
+            rospy.sleep(0.05)
     rospy.logwarn("[auto_land] TIMEOUT — PX4 未在窗口内 disarm "
                   "(不会因此停桨: cleanup 看到仍是 AUTO.LAND 会让 PX4 自己降完)")
     return False
