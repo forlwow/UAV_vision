@@ -71,6 +71,32 @@ from vb09.perception.ring.geom3d import ring_tilt_deg   # noqa: E402
 
 require_msgpack("必须安装 msgpack: pip install msgpack")       # zmq 可以没有 (--replay 离线回放)
 
+# =============================================================================
+# 可选：网页「识别画面」底部叠加「第二意见」信息条 (2026-11-24 黄圣鑫)
+#   · **默认关闭**, 用 --advice 显式打开; 不加这个参数时代码路径和以前完全一样
+#   · 检测 / 推流 / 状态机 / 接口: 一行没动
+#   · 画图在 advice_overlay.py, 查找顺序:
+#       环境变量 CPMV_ADV_DIR → 与 gcs_gate.py 同目录 → <仓库根>/MiniCPM-V/scripts
+#       → <上两级>/MiniCPM-V/scripts (本地开发布局)
+#   · 找不到 / 加载失败 / 画挂了 → 自动跳过, 画面和以前一样, 不影响检测主循环
+# =============================================================================
+_draw_advice = None
+_ADV_DIR = None
+try:
+    _adv_cands = []
+    if os.environ.get("CPMV_ADV_DIR"):
+        _adv_cands.append(os.environ["CPMV_ADV_DIR"])
+    _adv_cands.append(HERE)
+    _adv_cands.append(os.path.join(HERE, "MiniCPM-V", "scripts"))
+    _adv_cands.append(os.path.normpath(os.path.join(HERE, "..", "..", "MiniCPM-V", "scripts")))
+    _ADV_DIR = next((d for d in _adv_cands
+                     if d and os.path.exists(os.path.join(d, "advice_overlay.py"))), None)
+    if _ADV_DIR and _ADV_DIR not in sys.path:
+        sys.path.insert(0, _ADV_DIR)
+    from advice_overlay import draw_advice as _draw_advice   # noqa: E402
+except Exception:
+    _draw_advice = None
+
 UP_PORT, DOWN_PORT = 5555, 5556
 MODE_NAMES = {0: "OFF", 1: "GATE-SIM", 2: "GATE-REAL"}
 
@@ -669,12 +695,26 @@ def main():
     ap.add_argument("--replay-hz", type=float, default=10.0)
     ap.add_argument("--show-mask", action="store_true",
                     help="画面右边拼上饱和度掩码 (白 = 检测器认为是彩色的像素), 调 s_min/v_min 用")
+    ap.add_argument("--advice", action="store_true",
+                    help="画面底部叠加「第二意见」信息条 (需 advice_overlay.py + 建议 JSON); 默认关")
+    ap.add_argument("--advice-file", default=None,
+                    help="建议 JSON 路径 (默认 $TMPDIR/cpmv_advice.json; 也可用环境变量 CPMV_ADVICE)")
     ap.add_argument("--real", action="store_true", help=argparse.SUPPRESS)     # 旧写法 = --mode 2
     args = ap.parse_args()
     if not args.drone and not args.replay:
         ap.error("要么 --drone <飞机IP>, 要么 --replay <目录>")
     if zmq is None and not args.replay:
         sys.exit("pip install pyzmq")
+
+    # ---- 建议叠加: 默认关, 只有显式 --advice 才启用 ----
+    advice_on = False
+    if args.advice:
+        if _draw_advice is None:
+            print("[gcs_gate] --advice 指定了, 但 advice_overlay.py 加载失败 — 忽略, 画面和以前一样")
+        else:
+            advice_on = True
+            print("[gcs_gate] 建议叠加已启用 (%s): %s"
+                  % ("--advice-file" if args.advice_file else "默认路径", _ADV_DIR or "-"))
 
     # ---- 参数提示 (老参数在 gate 版不起作用的, 只提示不报错) ----
     if args.real:
@@ -894,6 +934,15 @@ def main():
                     vis = det.ground_draw(L, fr, fst) if fr is not None else L.copy()
                 else:
                     vis = det.draw(L, fr, None, text=False) if fr is not None else L.copy()
+                # 第二意见叠加: 在 --show-mask 拼接**之前**画
+                #   （画在拼接之后的话, 归一化坐标会按拼接后的双倍宽度换算, 框会被横向拉长 2 倍）
+                if advice_on:
+                    try:
+                        vis = _draw_advice(vis, args.advice_file)
+                    except Exception as _e:
+                        if str(_e) != globals().get("_adv_err"):
+                            globals()["_adv_err"] = str(_e)
+                            print("[gcs_gate] ! 建议叠加异常(忽略): %s" % _e)
                 if args.show_mask and fr is not None:
                     if hooks:
                         vis = np.hstack([vis, det.mask(L)])
