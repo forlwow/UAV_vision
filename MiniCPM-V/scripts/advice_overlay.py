@@ -110,7 +110,9 @@ def _put_ascii(bgr, items):
     """PIL 或中文字体都没有时的兜底：cv2.putText 画 ASCII（中文字符被过滤）。"""
     for text, xy, size, col in items:
         s = "".join(ch for ch in text if 32 <= ord(ch) < 127) or "-"
-        cv2.putText(bgr, s, xy, cv2.FONT_HERSHEY_SIMPLEX, max(0.4, size / 24.0), col, 2)
+        # items 的 xy 按 PIL 左上角约定，cv2.putText 按左下角基线 → y 下移 size
+        cv2.putText(bgr, s, (xy[0], xy[1] + size),
+                    cv2.FONT_HERSHEY_SIMPLEX, max(0.4, size / 24.0), col, 2)
     return bgr
 
 
@@ -260,7 +262,7 @@ def _badge(img, advice):
     x0, y0 = 8, 8
     plate = img[y0:y0 + bh, x0:x0 + bw].copy()
     cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (0, 0, 0), -1)
-    img[y0:y0 + bh, x0:x0 + bw] = cv2.addWeighted(img[y0:y0 + bh, x0:x0 + bw], 0.35, plate, 0.0, 0)
+    img[y0:y0 + bh, x0:x0 + bw] = cv2.addWeighted(img[y0:y0 + bh, x0:x0 + bw], 0.65, plate, 0.35, 0)
     cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (90, 90, 90), 1)
     put = []
     y = y0 + pad // 2

@@ -80,22 +80,25 @@ require_msgpack("必须安装 msgpack: pip install msgpack")       # zmq 可以�
 #       → <上两级>/MiniCPM-V/scripts (本地开发布局)
 #   · 找不到 / 加载失败 / 画挂了 → 自动跳过, 画面和以前一样, 不影响检测主循环
 # =============================================================================
-_draw_advice = None
-_ADV_DIR = None
-try:
-    _adv_cands = []
+def _load_advice_overlay():
+    """按需加载 advice_overlay.draw_advice；仅在 --advice / --advice-file 启用时调用。"""
+    cands = []
     if os.environ.get("CPMV_ADV_DIR"):
-        _adv_cands.append(os.environ["CPMV_ADV_DIR"])
-    _adv_cands.append(HERE)
-    _adv_cands.append(os.path.join(HERE, "MiniCPM-V", "scripts"))
-    _adv_cands.append(os.path.normpath(os.path.join(HERE, "..", "..", "MiniCPM-V", "scripts")))
-    _ADV_DIR = next((d for d in _adv_cands
-                     if d and os.path.exists(os.path.join(d, "advice_overlay.py"))), None)
-    if _ADV_DIR and _ADV_DIR not in sys.path:
-        sys.path.insert(0, _ADV_DIR)
-    from advice_overlay import draw_advice as _draw_advice   # noqa: E402
-except Exception:
-    _draw_advice = None
+        cands.append(os.environ["CPMV_ADV_DIR"])
+    cands.append(HERE)
+    cands.append(os.path.join(HERE, "MiniCPM-V", "scripts"))
+    cands.append(os.path.normpath(os.path.join(HERE, "..", "..", "MiniCPM-V", "scripts")))
+    adv_dir = next((d for d in cands
+                    if d and os.path.exists(os.path.join(d, "advice_overlay.py"))), None)
+    if not adv_dir:
+        return None, None
+    try:
+        if adv_dir not in sys.path:
+            sys.path.insert(0, adv_dir)
+        from advice_overlay import draw_advice  # noqa: E402
+        return draw_advice, adv_dir
+    except Exception:
+        return None, adv_dir
 
 UP_PORT, DOWN_PORT = 5555, 5556
 MODE_NAMES = {0: "OFF", 1: "GATE-SIM", 2: "GATE-REAL"}
@@ -698,7 +701,7 @@ def main():
     ap.add_argument("--advice", action="store_true",
                     help="画面底部叠加「第二意见」信息条 (需 advice_overlay.py + 建议 JSON); 默认关")
     ap.add_argument("--advice-file", default=None,
-                    help="建议 JSON 路径 (默认 $TMPDIR/cpmv_advice.json; 也可用环境变量 CPMV_ADVICE)")
+                    help="建议 JSON 路径 (指定时自动启用 --advice; 默认 $TMPDIR/cpmv_advice.json; 也可用 CPMV_ADVICE)")
     ap.add_argument("--real", action="store_true", help=argparse.SUPPRESS)     # 旧写法 = --mode 2
     args = ap.parse_args()
     if not args.drone and not args.replay:
@@ -706,15 +709,15 @@ def main():
     if zmq is None and not args.replay:
         sys.exit("pip install pyzmq")
 
-    # ---- 建议叠加: 默认关, 只有显式 --advice 才启用 ----
-    advice_on = False
-    if args.advice:
-        if _draw_advice is None:
+    # ---- 建议叠加: 默认关, 只有显式 --advice / --advice-file 才按需加载启用 ----
+    draw_advice_fn = None
+    if args.advice or args.advice_file:
+        draw_advice_fn, adv_dir = _load_advice_overlay()
+        if draw_advice_fn is None:
             print("[gcs_gate] --advice 指定了, 但 advice_overlay.py 加载失败 — 忽略, 画面和以前一样")
         else:
-            advice_on = True
             print("[gcs_gate] 建议叠加已启用 (%s): %s"
-                  % ("--advice-file" if args.advice_file else "默认路径", _ADV_DIR or "-"))
+                  % (args.advice_file or "默认路径", adv_dir or "-"))
 
     # ---- 参数提示 (老参数在 gate 版不起作用的, 只提示不报错) ----
     if args.real:
@@ -936,9 +939,9 @@ def main():
                     vis = det.draw(L, fr, None, text=False) if fr is not None else L.copy()
                 # 第二意见叠加: 在 --show-mask 拼接**之前**画
                 #   （画在拼接之后的话, 归一化坐标会按拼接后的双倍宽度换算, 框会被横向拉长 2 倍）
-                if advice_on:
+                if draw_advice_fn is not None:
                     try:
-                        vis = _draw_advice(vis, args.advice_file)
+                        vis = draw_advice_fn(vis, args.advice_file)
                     except Exception as _e:
                         if str(_e) != globals().get("_adv_err"):
                             globals()["_adv_err"] = str(_e)

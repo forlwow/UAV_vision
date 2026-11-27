@@ -5,7 +5,6 @@ data/results/*
 !data/results/.gitkeep
 *.log
 data/synthetic/
-__pycache__/
 # 大媒体文件不进仓库（保留在磁盘上）
 *.mp4
 *.avi
